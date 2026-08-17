@@ -69,8 +69,15 @@ data class Settings(
     val eeCycleRate: Int = 0,
     /** EmuCore/Speedhacks/EECycleSkip — 0..3. 0 = no skip. */
     val eeCycleSkip: Int = 0,
-    /** EE/FPU clamp mode — 0 None / 1 Normal / 2 Extra / 3 Full (PCSX2 default Normal).
-     *  Unpacks to EmuCore/CPU/Recompiler fpuOverflow/fpuExtraOverflow/fpuFullMode. */
+    /** EE/FPU clamp mode — 0 None / 1 Normal / 2 Extra / 3 Full / 4 Exact
+     *  (PCSX2 default Normal). Unpacks to EmuCore/CPU/Recompiler
+     *  fpuOverflow/fpuExtraOverflow/fpuFullMode/fpuExactMode.
+     *  4 is Full plus the rest of the EE multiplier's one-ULP deficit and a
+     *  divide/sqrt/rsqrt that runs the unit's own recurrence out of line, so it
+     *  costs a call per divide. ⚠️ The GameDB overwrites this whole tier for any
+     *  title carrying an eeClampMode entry, and an entry below 4 CLEARS the
+     *  exact bit — so on those titles the choice is inert unless game fixes are
+     *  off. Keep any bound in the pickers in sync with this list. */
     val eeClampMode: Int = 1,
     /** VU clamp mode — 0 None / 1 Normal / 2 Extra / 3 Extra+Sign (PCSX2 default Normal).
      *  Unpacks to vu0/vu1 Overflow/ExtraOverflow/SignOverflow. */
@@ -207,8 +214,6 @@ data class Settings(
     val gamefixInstantDma: Boolean = false,
     /** EmuCore/Gamefixes/BlitInternalFPSHack. */
     val gamefixBlitInternalFps: Boolean = false,
-    /** EmuCore/Gamefixes/FpuMulHack — Tales of Destiny. */
-    val gamefixFpuMul: Boolean = false,
     /** EmuCore/Gamefixes/OPHFlagHack — Bleach Blade Battlers. */
     val gamefixOphFlag: Boolean = false,
     /** EmuCore/Gamefixes/GIFFIFOHack — emulate the GIF FIFO (Test Drive Unlimited). */
@@ -569,6 +574,24 @@ data class Settings(
      *  off regardless of the flag, and it's a no-op if this build has no librashader. */
     val shaderChainEnabled: Boolean = false,
     val shaderChainPreset: String = "",
+    /** EmuCore/GS/LsfgEnabled + /LsfgMultiplier + /LsfgDllPath — LSFG frame generation,
+     *  inserted into the Vulkan present path. Off unless the user both enables it AND
+     *  supplies their own Lossless.dll: the interpolation shaders are read out of that
+     *  file at runtime and nothing about them ships with ARMSX2. Vulkan + Adreno 7xx and
+     *  newer only, and absent entirely from the Play build. [lsfgMultiplier] is frames
+     *  DISPLAYED per frame rendered, so 2 means one interpolated frame between each pair. */
+    val lsfgEnabled: Boolean = false,
+    val lsfgMultiplier: Int = 2,
+    val lsfgDllPath: String = "",
+    /** EmuCore/GS/LsfgPerformance — LSFG 3.1p, a lighter shader family than 3.1. On by default:
+     *  this runs on a phone GPU that is already busy presenting the game, and the cheaper
+     *  pipeline is what makes frame generation pay for itself there. Falls back to 3.1 by itself
+     *  when the user's Lossless.dll predates 3.1p. */
+    val lsfgPerformance: Boolean = true,
+    /** EmuCore/GS/LsfgFlowScale — optical-flow resolution, as a PERCENTAGE of the presented
+     *  image (25..100). Lower is cheaper and blurrier. The native side inverts it: the library
+     *  takes a divisor, so 25% becomes 4.0. See GSLsfg.cpp. */
+    val lsfgFlowScale: Int = 100,
     /** Tweaked shader parameters, as `preset path -> (parameter name -> value)`.
      *
      *  Sparse: a parameter the user hasn't touched is simply absent, and the author's own
@@ -584,6 +607,13 @@ data class Settings(
     val casMode: Int = 0,
     /** EmuCore/GS/CASSharpness — sharpening strength 0..100 (%). */
     val casSharpness: Int = 50,
+    /** EmuCore/GS/Upscaler — GSUpscaler: 0 Off / 1 MetalFX (Apple only) / 2 FSR1.
+     *  1 is unreachable from this UI; the values are the core enum's, and it is persisted
+     *  as an integer, so they must not be renumbered to close the gap. */
+    val upscaler: Int = 0,
+    /** EmuCore/GS/FSRSharpness — FSR1 RCAS strength 0..100 (%). Separate from casSharpness:
+     *  RCAS runs on a different curve, so the two sliders are not interchangeable. */
+    val fsrSharpness: Int = 50,
     /** EmuCore/GS/LoadTextureReplacements. */
     val loadTextureReplacements: Boolean = false,
     /** EmuCore/GS/LoadTextureReplacementsAsync. */
@@ -731,6 +761,10 @@ data class Settings(
         put("EmuCore/CPU/Recompiler", "fpuOverflow", "bool", (eeClampMode >= 1).toString())
         put("EmuCore/CPU/Recompiler", "fpuExtraOverflow", "bool", (eeClampMode >= 2).toString())
         put("EmuCore/CPU/Recompiler", "fpuFullMode", "bool", (eeClampMode >= 3).toString())
+        // The four are cumulative and emucore validates them as such: an
+        // inconsistent set is silently reset to defaults on load rather than
+        // rejected, so all four go out together or none of them mean anything.
+        put("EmuCore/CPU/Recompiler", "fpuExactMode", "bool", (eeClampMode >= 4).toString())
         for (vu in arrayOf("vu0", "vu1")) {
             put("EmuCore/CPU/Recompiler", "${vu}Overflow", "bool", (vuClampMode >= 1).toString())
             put("EmuCore/CPU/Recompiler", "${vu}ExtraOverflow", "bool", (vuClampMode >= 2).toString())
@@ -821,7 +855,6 @@ data class Settings(
         put("EmuCore/Gamefixes", "EETimingHack", "bool", gamefixEETiming.toString())
         put("EmuCore/Gamefixes", "InstantDMAHack", "bool", gamefixInstantDma.toString())
         put("EmuCore/Gamefixes", "BlitInternalFPSHack", "bool", gamefixBlitInternalFps.toString())
-        put("EmuCore/Gamefixes", "FpuMulHack", "bool", gamefixFpuMul.toString())
         put("EmuCore/Gamefixes", "OPHFlagHack", "bool", gamefixOphFlag.toString())
         put("EmuCore/Gamefixes", "GIFFIFOHack", "bool", gamefixGifFifo.toString())
         put("EmuCore/Gamefixes", "DMABusyHack", "bool", gamefixDmaBusy.toString())
@@ -963,14 +996,18 @@ data class Settings(
         fun floatAt(key: String): Float? = ini[key]?.toFloatOrNull()
         fun strAt(key: String): String? = ini[key]
 
-        // EE/FPU clamp (0 None / 1 Normal / 2 Extra / 3 Full) is packed by applyTo into
-        // three cumulative bool keys (fpuOverflow>=1, fpuExtraOverflow>=2, fpuFullMode>=3).
+        // EE/FPU clamp (0 None / 1 Normal / 2 Extra / 3 Full / 4 Exact) is packed by
+        // applyTo into four cumulative bool keys (fpuOverflow>=1, fpuExtraOverflow>=2,
+        // fpuFullMode>=3, fpuExactMode>=4). Read them back highest-first, and treat the
+        // exact key's absence as an older core rather than as mode 3 — a build without it
+        // never wrote the key, and inferring 3 there would silently demote the setting.
         val eeClamp = run {
             val fo = boolAt("EmuCore/CPU/Recompiler/fpuOverflow")
             val fe = boolAt("EmuCore/CPU/Recompiler/fpuExtraOverflow")
             val ff = boolAt("EmuCore/CPU/Recompiler/fpuFullMode")
-            if (fo == null && fe == null && ff == null) this.eeClampMode
-            else if (ff == true) 3 else if (fe == true) 2 else if (fo == true) 1 else 0
+            val fx = boolAt("EmuCore/CPU/Recompiler/fpuExactMode")
+            if (fo == null && fe == null && ff == null && fx == null) this.eeClampMode
+            else if (fx == true) 4 else if (ff == true) 3 else if (fe == true) 2 else if (fo == true) 1 else 0
         }
         // VU clamp (0 None / 1 Normal / 2 Extra / 3 Extra+Sign) — same packing on vu0*
         // (applyTo writes vu0 and vu1 identically, so reading vu0 recovers the mode).
@@ -1039,7 +1076,6 @@ data class Settings(
             gamefixEETiming = boolAt("EmuCore/Gamefixes/EETimingHack") ?: this.gamefixEETiming,
             gamefixInstantDma = boolAt("EmuCore/Gamefixes/InstantDMAHack") ?: this.gamefixInstantDma,
             gamefixBlitInternalFps = boolAt("EmuCore/Gamefixes/BlitInternalFPSHack") ?: this.gamefixBlitInternalFps,
-            gamefixFpuMul = boolAt("EmuCore/Gamefixes/FpuMulHack") ?: this.gamefixFpuMul,
             gamefixOphFlag = boolAt("EmuCore/Gamefixes/OPHFlagHack") ?: this.gamefixOphFlag,
             gamefixGifFifo = boolAt("EmuCore/Gamefixes/GIFFIFOHack") ?: this.gamefixGifFifo,
             gamefixDmaBusy = boolAt("EmuCore/Gamefixes/DMABusyHack") ?: this.gamefixDmaBusy,
@@ -1156,6 +1192,11 @@ data class Settings(
             fxaa = boolAt("EmuCore/GS/fxaa") ?: this.fxaa,
             shaderChainEnabled = boolAt("EmuCore/GS/ShaderChainEnabled") ?: this.shaderChainEnabled,
             shaderChainPreset = strAt("EmuCore/GS/ShaderChainPreset") ?: this.shaderChainPreset,
+            lsfgEnabled = boolAt("EmuCore/GS/LsfgEnabled") ?: this.lsfgEnabled,
+            lsfgMultiplier = intAt("EmuCore/GS/LsfgMultiplier") ?: this.lsfgMultiplier,
+            lsfgDllPath = strAt("EmuCore/GS/LsfgDllPath") ?: this.lsfgDllPath,
+            lsfgPerformance = boolAt("EmuCore/GS/LsfgPerformance") ?: this.lsfgPerformance,
+            lsfgFlowScale = intAt("EmuCore/GS/LsfgFlowScale") ?: this.lsfgFlowScale,
             shaderChainParams = strAt("EmuCore/GS/ShaderChainParams")?.let { raw ->
                 // Hand-editable file, so a malformed blob is a real possibility: keep the
                 // rest of the recovered settings rather than throwing the lot away.
@@ -1163,6 +1204,8 @@ data class Settings(
             } ?: this.shaderChainParams,
             casMode = intAt("EmuCore/GS/CASMode") ?: this.casMode,
             casSharpness = intAt("EmuCore/GS/CASSharpness") ?: this.casSharpness,
+            upscaler = intAt("EmuCore/GS/Upscaler") ?: this.upscaler,
+            fsrSharpness = intAt("EmuCore/GS/FSRSharpness") ?: this.fsrSharpness,
             loadTextureReplacements = boolAt("EmuCore/GS/LoadTextureReplacements") ?: this.loadTextureReplacements,
             loadTextureReplacementsAsync = boolAt("EmuCore/GS/LoadTextureReplacementsAsync") ?: this.loadTextureReplacementsAsync,
             precacheTextureReplacements = boolAt("EmuCore/GS/PrecacheTextureReplacements") ?: this.precacheTextureReplacements,
@@ -1353,6 +1396,13 @@ data class Settings(
         put("EmuCore/GS", "fxaa", "bool", fxaa.toString())
         put("EmuCore/GS", "ShaderChainEnabled", "bool", shaderChainEnabled.toString())
         put("EmuCore/GS", "ShaderChainPreset", "string", shaderChainPreset)
+        put("EmuCore/GS", "LsfgEnabled", "bool", lsfgEnabled.toString())
+        put("EmuCore/GS", "LsfgMultiplier", "int", lsfgMultiplier.toString())
+        put("EmuCore/GS", "LsfgDllPath", "string", lsfgDllPath)
+        put("EmuCore/GS", "LsfgPerformance", "bool", lsfgPerformance.toString())
+        // Clamped to the same 25..100 the native side enforces. A value outside it would be
+        // coerced there anyway, and the two disagreeing is how a slider ends up looking stuck.
+        put("EmuCore/GS", "LsfgFlowScale", "int", lsfgFlowScale.coerceIn(25, 100).toString())
         // Parameter overrides, as one opaque JSON blob. Nothing in emucore reads this key —
         // there is no GSConfig field behind it, and the live values reach the renderer via
         // the push below, not through here. It is written so the map survives the same
@@ -1369,6 +1419,10 @@ data class Settings(
             ShaderParams.push(shaderChainPreset, shaderChainParams[shaderChainPreset].orEmpty())
         put("EmuCore/GS", "CASMode", "int", casMode.coerceIn(0, 2).toString())
         put("EmuCore/GS", "CASSharpness", "int", casSharpness.coerceIn(0, 100).toString())
+        // Upper bound is UPSCALER_FSR1, not the count of options this UI shows — clamping to
+        // the visible choices would silently rewrite FSR1 back to Off.
+        put("EmuCore/GS", "Upscaler", "int", upscaler.coerceIn(UPSCALER_OFF, UPSCALER_FSR1).toString())
+        put("EmuCore/GS", "FSRSharpness", "int", fsrSharpness.coerceIn(0, 100).toString())
         put("EmuCore/GS", "LoadTextureReplacements", "bool", loadTextureReplacements.toString())
         put("EmuCore/GS", "LoadTextureReplacementsAsync", "bool", loadTextureReplacementsAsync.toString())
         put("EmuCore/GS", "PrecacheTextureReplacements", "bool", precacheTextureReplacements.toString())
@@ -1533,8 +1587,15 @@ data class Settings(
             shadeBoostSaturation != other.shadeBoostSaturation ||
             shadeBoostGamma != other.shadeBoostGamma ||
             fxaa != other.fxaa ||
+            lsfgEnabled != other.lsfgEnabled ||
+            lsfgMultiplier != other.lsfgMultiplier ||
+            lsfgDllPath != other.lsfgDllPath ||
+            lsfgPerformance != other.lsfgPerformance ||
+            lsfgFlowScale != other.lsfgFlowScale ||
             casMode != other.casMode ||
             casSharpness != other.casSharpness ||
+            upscaler != other.upscaler ||
+            fsrSharpness != other.fsrSharpness ||
             accurateBlendingUnit != other.accurateBlendingUnit ||
             hwMipmap != other.hwMipmap ||
             triFilter != other.triFilter ||
@@ -1631,7 +1692,6 @@ data class Settings(
         put("gamefixEETiming", gamefixEETiming)
         put("gamefixInstantDma", gamefixInstantDma)
         put("gamefixBlitInternalFps", gamefixBlitInternalFps)
-        put("gamefixFpuMul", gamefixFpuMul)
         put("gamefixOphFlag", gamefixOphFlag)
         put("gamefixGifFifo", gamefixGifFifo)
         put("gamefixDmaBusy", gamefixDmaBusy)
@@ -1749,8 +1809,18 @@ data class Settings(
         put("shaderChainEnabled", shaderChainEnabled)
         put("shaderChainPreset", shaderChainPreset)
         put("shaderChainParams", shaderChainParamsToJson(shaderChainParams))
+        // These five were missing from the JSON round-trip entirely, which IS the persistence
+        // format — so every LSFG choice, the imported DLL path included, was thrown away the
+        // moment the app was restarted.
+        put("lsfgEnabled", lsfgEnabled)
+        put("lsfgMultiplier", lsfgMultiplier)
+        put("lsfgDllPath", lsfgDllPath)
+        put("lsfgPerformance", lsfgPerformance)
+        put("lsfgFlowScale", lsfgFlowScale)
         put("casMode", casMode)
         put("casSharpness", casSharpness)
+        put("upscaler", upscaler)
+        put("fsrSharpness", fsrSharpness)
         put("loadTextureReplacements", loadTextureReplacements)
         put("loadTextureReplacementsAsync", loadTextureReplacementsAsync)
         put("precacheTextureReplacements", precacheTextureReplacements)
@@ -1813,6 +1883,12 @@ data class Settings(
          *  touching the base layer or re-poking the running VM. */
         @JvmStatic
         internal var emitSink: ((String, String, String, String) -> Unit)? = null
+
+        /** [upscaler] values, straight from the core's GSUpscaler. Named because 1 is Apple's
+         *  MetalFX and never appears in this UI, so FSR1's value (2) does NOT line up with its
+         *  position in any Android picker — writing the picker index would select MetalFX. */
+        const val UPSCALER_OFF = 0
+        const val UPSCALER_FSR1 = 2
 
         /** One-tap "Low-End" performance snapshot applied on top of [base].
          *  Only cheap, safe-for-most levers that already exist as fields:
@@ -1894,7 +1970,6 @@ data class Settings(
                 gamefixEETiming = json.optBoolean("gamefixEETiming", def.gamefixEETiming),
                 gamefixInstantDma = json.optBoolean("gamefixInstantDma", def.gamefixInstantDma),
                 gamefixBlitInternalFps = json.optBoolean("gamefixBlitInternalFps", def.gamefixBlitInternalFps),
-                gamefixFpuMul = json.optBoolean("gamefixFpuMul", def.gamefixFpuMul),
                 gamefixOphFlag = json.optBoolean("gamefixOphFlag", def.gamefixOphFlag),
                 gamefixGifFifo = json.optBoolean("gamefixGifFifo", def.gamefixGifFifo),
                 gamefixDmaBusy = json.optBoolean("gamefixDmaBusy", def.gamefixDmaBusy),
@@ -2023,8 +2098,15 @@ data class Settings(
                 shaderChainPreset = json.optString("shaderChainPreset", def.shaderChainPreset),
                 shaderChainParams = json.optJSONObject("shaderChainParams")
                     ?.let { shaderChainParamsFromJson(it) } ?: def.shaderChainParams,
+                lsfgEnabled = json.optBoolean("lsfgEnabled", def.lsfgEnabled),
+                lsfgMultiplier = json.optInt("lsfgMultiplier", def.lsfgMultiplier),
+                lsfgDllPath = json.optString("lsfgDllPath", def.lsfgDllPath),
+                lsfgPerformance = json.optBoolean("lsfgPerformance", def.lsfgPerformance),
+                lsfgFlowScale = json.optInt("lsfgFlowScale", def.lsfgFlowScale),
                 casMode = json.optInt("casMode", def.casMode),
                 casSharpness = json.optInt("casSharpness", def.casSharpness),
+                upscaler = json.optInt("upscaler", def.upscaler),
+                fsrSharpness = json.optInt("fsrSharpness", def.fsrSharpness),
                 loadTextureReplacements = json.optBoolean("loadTextureReplacements", def.loadTextureReplacements),
                 loadTextureReplacementsAsync = json.optBoolean("loadTextureReplacementsAsync", def.loadTextureReplacementsAsync),
                 precacheTextureReplacements = json.optBoolean("precacheTextureReplacements", def.precacheTextureReplacements),
@@ -2141,7 +2223,6 @@ data class Settings(
             if (current.gamefixEETiming != base.gamefixEETiming) j.put("gamefixEETiming", current.gamefixEETiming)
             if (current.gamefixInstantDma != base.gamefixInstantDma) j.put("gamefixInstantDma", current.gamefixInstantDma)
             if (current.gamefixBlitInternalFps != base.gamefixBlitInternalFps) j.put("gamefixBlitInternalFps", current.gamefixBlitInternalFps)
-            if (current.gamefixFpuMul        != base.gamefixFpuMul)        j.put("gamefixFpuMul", current.gamefixFpuMul)
             if (current.gamefixOphFlag       != base.gamefixOphFlag)       j.put("gamefixOphFlag", current.gamefixOphFlag)
             if (current.gamefixGifFifo       != base.gamefixGifFifo)       j.put("gamefixGifFifo", current.gamefixGifFifo)
             if (current.gamefixDmaBusy       != base.gamefixDmaBusy)       j.put("gamefixDmaBusy", current.gamefixDmaBusy)
@@ -2261,8 +2342,15 @@ data class Settings(
             if (current.shaderChainEnabled  != base.shaderChainEnabled)  j.put("shaderChainEnabled", current.shaderChainEnabled)
             if (current.shaderChainPreset   != base.shaderChainPreset)   j.put("shaderChainPreset", current.shaderChainPreset)
             if (current.shaderChainParams   != base.shaderChainParams)   j.put("shaderChainParams", shaderChainParamsToJson(current.shaderChainParams))
+            if (current.lsfgEnabled         != base.lsfgEnabled)         j.put("lsfgEnabled", current.lsfgEnabled)
+            if (current.lsfgMultiplier      != base.lsfgMultiplier)      j.put("lsfgMultiplier", current.lsfgMultiplier)
+            if (current.lsfgDllPath         != base.lsfgDllPath)         j.put("lsfgDllPath", current.lsfgDllPath)
+            if (current.lsfgPerformance     != base.lsfgPerformance)     j.put("lsfgPerformance", current.lsfgPerformance)
+            if (current.lsfgFlowScale       != base.lsfgFlowScale)       j.put("lsfgFlowScale", current.lsfgFlowScale)
             if (current.casMode             != base.casMode)             j.put("casMode", current.casMode)
             if (current.casSharpness        != base.casSharpness)        j.put("casSharpness", current.casSharpness)
+            if (current.upscaler            != base.upscaler)            j.put("upscaler", current.upscaler)
+            if (current.fsrSharpness        != base.fsrSharpness)        j.put("fsrSharpness", current.fsrSharpness)
             if (current.loadTextureReplacements != base.loadTextureReplacements) j.put("loadTextureReplacements", current.loadTextureReplacements)
             if (current.loadTextureReplacementsAsync != base.loadTextureReplacementsAsync) j.put("loadTextureReplacementsAsync", current.loadTextureReplacementsAsync)
             if (current.precacheTextureReplacements != base.precacheTextureReplacements) j.put("precacheTextureReplacements", current.precacheTextureReplacements)
@@ -2376,7 +2464,6 @@ data class Settings(
             gamefixEETiming = if (overrides.has("gamefixEETiming")) overrides.getBoolean("gamefixEETiming") else base.gamefixEETiming,
             gamefixInstantDma = if (overrides.has("gamefixInstantDma")) overrides.getBoolean("gamefixInstantDma") else base.gamefixInstantDma,
             gamefixBlitInternalFps = if (overrides.has("gamefixBlitInternalFps")) overrides.getBoolean("gamefixBlitInternalFps") else base.gamefixBlitInternalFps,
-            gamefixFpuMul = if (overrides.has("gamefixFpuMul")) overrides.getBoolean("gamefixFpuMul") else base.gamefixFpuMul,
             gamefixOphFlag = if (overrides.has("gamefixOphFlag")) overrides.getBoolean("gamefixOphFlag") else base.gamefixOphFlag,
             gamefixGifFifo = if (overrides.has("gamefixGifFifo")) overrides.getBoolean("gamefixGifFifo") else base.gamefixGifFifo,
             gamefixDmaBusy = if (overrides.has("gamefixDmaBusy")) overrides.getBoolean("gamefixDmaBusy") else base.gamefixDmaBusy,
@@ -2516,8 +2603,15 @@ data class Settings(
             shaderChainParams = if (overrides.has("shaderChainParams")) {
                 shaderChainParamsFromJson(overrides.optJSONObject("shaderChainParams"))
             } else base.shaderChainParams,
+            lsfgEnabled = if (overrides.has("lsfgEnabled")) overrides.getBoolean("lsfgEnabled") else base.lsfgEnabled,
+            lsfgMultiplier = if (overrides.has("lsfgMultiplier")) overrides.getInt("lsfgMultiplier") else base.lsfgMultiplier,
+            lsfgDllPath = if (overrides.has("lsfgDllPath")) overrides.getString("lsfgDllPath") else base.lsfgDllPath,
+            lsfgPerformance = if (overrides.has("lsfgPerformance")) overrides.getBoolean("lsfgPerformance") else base.lsfgPerformance,
+            lsfgFlowScale = if (overrides.has("lsfgFlowScale")) overrides.getInt("lsfgFlowScale") else base.lsfgFlowScale,
             casMode = if (overrides.has("casMode")) overrides.getInt("casMode") else base.casMode,
             casSharpness = if (overrides.has("casSharpness")) overrides.getInt("casSharpness") else base.casSharpness,
+            upscaler = if (overrides.has("upscaler")) overrides.getInt("upscaler") else base.upscaler,
+            fsrSharpness = if (overrides.has("fsrSharpness")) overrides.getInt("fsrSharpness") else base.fsrSharpness,
             loadTextureReplacements = if (overrides.has("loadTextureReplacements")) overrides.getBoolean("loadTextureReplacements") else base.loadTextureReplacements,
             loadTextureReplacementsAsync = if (overrides.has("loadTextureReplacementsAsync")) overrides.getBoolean("loadTextureReplacementsAsync") else base.loadTextureReplacementsAsync,
             precacheTextureReplacements = if (overrides.has("precacheTextureReplacements")) overrides.getBoolean("precacheTextureReplacements") else base.precacheTextureReplacements,

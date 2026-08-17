@@ -1,4 +1,7 @@
 add_pcsx2_test(core_test
+	ee_fpu_regfile_tests.cpp
+	ee_clamp_mode_tests.cpp
+	ee_fpu_reloc_tests.cpp
 	patch_tests.cpp
 	savestate_legacy_tests.cpp
 	MockMemoryInterface.h
@@ -19,6 +22,9 @@ endif()
 
 # GS vertex front-end kernel oracle (arch-neutral).
 add_subdirectory(gs)
+
+# IPU colour-conversion oracle (arch-neutral: each host tests its own path).
+add_subdirectory(ipu)
 
 
 set(multi_isa_sources

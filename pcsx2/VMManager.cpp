@@ -3200,6 +3200,10 @@ void VMManager::CheckForCPUConfigChanges(const Pcsx2Config& old_config)
 	Console.WriteLn("Updating CPU configuration...");
 	FPControlRegister::SetCurrent(EmuConfig.Cpu.FPUFPCR);
 
+	// Before the code cache is thrown away below, so no emitted code and the
+	// file it works on can disagree about what a slot holds.
+	eeFprSyncSlotFormat();
+
 	// The VU program cache toggle (EnableVUProgramCache) is picked up by the
 	// mVUreset that ClearCPUExecutionCaches triggers below — recording and the
 	// disk cache are re-synced there from the live config, so no explicit sync
@@ -3346,6 +3350,20 @@ void VMManager::CheckForMiscConfigChanges(const Pcsx2Config& old_config)
 		else
 			ShutdownDiscordPresence();
 	}
+
+	// PINE is the same shape of thing as the Discord integration above -- an optional external
+	// service whose entire lifecycle is one bool plus a port -- but it was never wired to the
+	// settings path. ReloadPINE() had exactly two callers, CPUThreadInitialize() and
+	// UpdateDiscDetails(), so a toggle only took effect at the next app start or game change.
+	// On a handheld that reads as a broken switch: the UI says enabled, nothing is listening,
+	// and there is no separate window to restart into to discover otherwise.
+	//
+	// Called unconditionally rather than gated on old_config, because ReloadPINE() compares the
+	// request against the LIVE server -- is one initialized, and on which slot -- which is
+	// strictly stronger than a config diff. It early-returns when they already agree, and it
+	// recovers a server that lost an earlier bind (the port still in TIME_WAIT from a previous
+	// run is the usual way that happens) instead of trusting a config value that never changed.
+	ReloadPINE();
 
 	if (HasValidVM() && (EmuConfig.EnableThreadPinning != old_config.EnableThreadPinning ||
 							(s_thread_affinities_set && EmuConfig.Speedhacks.vuThread != old_config.Speedhacks.vuThread)))

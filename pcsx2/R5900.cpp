@@ -3,6 +3,7 @@
 
 #include "Common.h"
 
+#include "common/Path.h"
 #include "common/StringUtil.h"
 #include "ps2/BiosTools.h"
 #include "R5900.h"
@@ -69,6 +70,7 @@ void cpuReset()
 	cpuRegs.CP0.n.PRid		= 0x00002e20; // PRevID = Revision ID, same as R5900
 	fpuRegs.fprc[0]			= 0x00002e30; // fpu Revision..
 	fpuRegs.fprc[31]		= 0x01000001; // fpu Status/Control
+	eeFprSyncSlotFormat();
 
 	cpuRegs.nextEventCycle = cpuRegs.cycle + 4;
 	EEsCycle = 0;
@@ -729,7 +731,8 @@ void eeloadHook()
 		const std::string& elf_override = VMManager::Internal::GetELFOverride();
 		if (!elf_override.empty())
 		{
-			elfname = fmt::format("host:{}", elf_override);
+			// The host: root should be directory containg the elf, so get only the filename part
+			elfname = fmt::format("host:{}", Path::GetFileName(elf_override));
 		}
 		else
 		{

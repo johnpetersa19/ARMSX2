@@ -479,6 +479,9 @@ enum class GSUpscaler : u8
 {
 	Off,           ///< Plain bilinear present-time stretch (default).
 	MetalFXSpatial, ///< Apple MetalFX spatial upscaler (Metal backend, macOS 13+).
+	// Appended rather than inserted: this enum is persisted as an integer, so renumbering
+	// MetalFXSpatial would silently re-point every existing config at a different upscaler.
+	FSR1,          ///< AMD FidelityFX Super Resolution 1 (EASU + RCAS compute passes, Vulkan).
 };
 
 enum class GSHWAutoFlushLevel : u8
@@ -766,6 +769,7 @@ struct Pcsx2Config
 			fpuOverflow : 1,
 			fpuExtraOverflow : 1,
 			fpuFullMode : 1,
+			fpuExactMode : 1,
 			fpuGuardedAddSub : 1; // EE FPU add/sub guard-bit emulation (single-precision fast path). ON by default — the PS2-accurate behavior. Opt-OUT globally via INI for EE-FPU-heavy titles verified to render fine without it (each ADD.S/SUB.S then costs one op instead of the guard sequence). Independent of the clamp tiers: Full mode runs the DOUBLE path, which guards unconditionally regardless of this bit.
 
 		bool
@@ -1052,7 +1056,26 @@ struct Pcsx2Config
 		bool ShaderChainEnabled = false;
 		std::string ShaderChainPreset;
 
+		// LSFG — Lossless Scaling frame generation, inserted into the Vulkan present path.
+		// Off unless the user both enables it AND supplies their own Lossless.dll: the
+		// interpolation shaders are read out of that file at runtime and nothing about them
+		// ships with ARMSX2. Vulkan + Adreno 7xx and newer only, and compiled out entirely
+		// in the play flavour, so every one of these is inert in a build without it.
+		bool LsfgEnabled = false;
+		u8 LsfgMultiplier = 2; // frames displayed per rendered frame: 2 = one interpolated
+		std::string LsfgDllPath;
+		// LSFG 3.1p, a lighter shader family than 3.1. Default on: this runs on a phone GPU
+		// that is already presenting the game, and the cheaper pipeline is what makes the
+		// feature pay for itself there. Falls back to 3.1 when the user's DLL predates 3.1p.
+		bool LsfgPerformance = true;
+		// Optical-flow resolution, as a percentage of the presented image (25..100). Lower is
+		// cheaper and blurrier. Handed to the library as a DIVISOR — see GSLsfg.cpp.
+		u8 LsfgFlowScale = 100;
+
 		u8 CAS_Sharpness = 50;
+		// FSR1's RCAS pass, 0..100. Mapped to AMD's "stops" scale in GSDevice::FSR1Upscale,
+		// where 0 stops is maximum sharpening - it is not the same curve as CAS_Sharpness.
+		u8 FSR_Sharpness = 50;
 		u8 ShadeBoost_Brightness = DEFAULT_SHADEBOOST_BRIGHTNESS;
 		u8 ShadeBoost_Contrast = DEFAULT_SHADEBOOST_CONTRAST;
 		u8 ShadeBoost_Saturation = DEFAULT_SHADEBOOST_SATURATION;
@@ -1279,6 +1302,10 @@ struct Pcsx2Config
 	{
 		BITFIELD32()
 		bool
+			// No reader: eeMulRound (FPU.cpp) and emitDefectiveFmul
+			// (iFPUd-arm64.cpp) model the multiplier defect this patched one
+			// product of. The bit stays because its GamefixId indexes
+			// vu_capture's on-disk gamefix mask.
 			FpuMulHack : 1, // Tales of Destiny hangs.
 			GoemonTlbHack : 1, // Gomeon tlb miss hack. The game need to access unmapped virtual address. Instead to handle it as exception, tlb are preloaded at startup
 			SoftwareRendererFMVHack : 1, // Switches to software renderer for FMVs
@@ -1696,7 +1723,6 @@ namespace EmuFolders
 
 //------------ SPECIAL GAME FIXES!!! ---------------
 #define CHECK_VUADDSUBHACK (EmuConfig.Gamefixes.VuAddSubHack) // Special Fix for Tri-ace games, they use an encryption algorithm that requires VU addi opcode to be bit-accurate.
-#define CHECK_FPUMULHACK (EmuConfig.Gamefixes.FpuMulHack) // Special Fix for Tales of Destiny hangs.
 #define CHECK_XGKICKHACK (EmuConfig.Gamefixes.XgKickHack) // Special Fix for Erementar Gerad, adds more delay to VU XGkick instructions. Corrects the color of some graphics.
 #define CHECK_EETIMINGHACK (EmuConfig.Gamefixes.EETimingHack) // Fix all scheduled events to happen in 1 cycle.
 #define CHECK_INSTANTDMAHACK (EmuConfig.Gamefixes.InstantDMAHack) // Attempt to finish DMA's instantly, useful for games which rely on cache emulation.
@@ -1718,7 +1744,8 @@ namespace EmuFolders
 #define CHECK_FPU_OVERFLOW (EmuConfig.Cpu.Recompiler.fpuOverflow)
 #define CHECK_FPU_EXTRA_OVERFLOW (EmuConfig.Cpu.Recompiler.fpuExtraOverflow) // If enabled, Operands are checked for infinities before being used in the FPU recs
 #define CHECK_FPU_EXTRA_FLAGS 1 // Always enabled now // Sets D/I flags on FPU instructions
-#define CHECK_FPU_FULL (EmuConfig.Cpu.Recompiler.fpuFullMode)
+#define CHECK_FPU_FULL (EmuConfig.Cpu.Recompiler.fpuFullMode) // GameDB eeClampMode >= 3: the EE FPU's arithmetic is iFPUd's, computed in double over a relocated FPR file. Below it the single-precision fast path in iFPU-arm64.cpp runs.
+#define CHECK_FPU_EXACT (EmuConfig.Cpu.Recompiler.fpuExactMode) // GameDB eeClampMode 4: mode 3 plus the rest of the EE multiplier's one-ULP deficit, at emitDefectiveFmul (iFPUd-arm64.cpp).
 #define CHECK_FPU_GUARDED (EmuConfig.Cpu.Recompiler.fpuGuardedAddSub) // If enabled (default), add/sub emulate the PS2 FPU's missing mantissa guard bits on the single-precision fast path. Disable only for EE-heavy titles confirmed not to need it.
 
 //------------ EE Recompiler defines - Comment to disable a recompiler ---------------

@@ -473,6 +473,7 @@ Pcsx2Config::RecompilerOptions::RecompilerOptions()
 	fpuOverflow = true;
 	//fpuExtraOverflow = false;
 	//fpuFullMode = false;
+	//fpuExactMode = false;
 	fpuGuardedAddSub = true; // PS2-accurate add/sub guard-bit emulation; opt-out for perf on titles verified not to need it.
 }
 
@@ -486,12 +487,16 @@ void Pcsx2Config::RecompilerOptions::ApplySanityCheck()
 	if (fpuFullMode)
 		fpuIsRight = fpuOverflow && fpuExtraOverflow;
 
+	if (fpuExactMode)
+		fpuIsRight = fpuOverflow && fpuExtraOverflow && fpuFullMode;
+
 	if (!fpuIsRight)
 	{
 		// Values are wonky; assume the defaults.
 		fpuOverflow = RecompilerOptions().fpuOverflow;
 		fpuExtraOverflow = RecompilerOptions().fpuExtraOverflow;
 		fpuFullMode = RecompilerOptions().fpuFullMode;
+		fpuExactMode = RecompilerOptions().fpuExactMode;
 	}
 
 	bool vuIsOk = true;
@@ -552,12 +557,13 @@ void Pcsx2Config::RecompilerOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(fpuOverflow);
 	SettingsWrapBitBool(fpuExtraOverflow);
 	SettingsWrapBitBool(fpuFullMode);
+	SettingsWrapBitBool(fpuExactMode);
 	SettingsWrapBitBool(fpuGuardedAddSub);
 }
 
 u32 Pcsx2Config::RecompilerOptions::GetEEClampMode() const
 {
-	return fpuFullMode ? 3 : (fpuExtraOverflow ? 2 : (fpuOverflow ? 1 : 0));
+	return fpuExactMode ? 4 : (fpuFullMode ? 3 : (fpuExtraOverflow ? 2 : (fpuOverflow ? 1 : 0)));
 }
 
 void Pcsx2Config::RecompilerOptions::SetEEClampMode(u32 value)
@@ -565,6 +571,7 @@ void Pcsx2Config::RecompilerOptions::SetEEClampMode(u32 value)
 	fpuOverflow = (value >= 1);
 	fpuExtraOverflow = (value >= 2);
 	fpuFullMode = (value >= 3);
+	fpuExactMode = (value >= 4);
 }
 
 u32 Pcsx2Config::RecompilerOptions::GetVUClampMode() const
@@ -899,6 +906,7 @@ bool Pcsx2Config::GSOptions::OptionsAreEqual(const GSOptions& right) const
 		OpEqu(BackThreadMode) &&
 
 		OpEqu(CAS_Sharpness) &&
+		OpEqu(FSR_Sharpness) &&
 		OpEqu(ShadeBoost_Brightness) &&
 		OpEqu(ShadeBoost_Contrast) &&
 		OpEqu(ShadeBoost_Saturation) &&
@@ -918,6 +926,12 @@ bool Pcsx2Config::GSOptions::OptionsAreEqual(const GSOptions& right) const
 
 		OpEqu(ShaderChainEnabled) &&
 		OpEqu(ShaderChainPreset) &&
+
+		OpEqu(LsfgEnabled) &&
+		OpEqu(LsfgMultiplier) &&
+		OpEqu(LsfgDllPath) &&
+		OpEqu(LsfgPerformance) &&
+		OpEqu(LsfgFlowScale) &&
 
 		OpEqu(CaptureContainer) &&
 		OpEqu(VideoCaptureCodec) &&
@@ -1149,6 +1163,8 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapIntEnumEx(CASMode, "CASMode");
 	SettingsWrapIntEnumEx(Upscaler, "Upscaler");
 	SettingsWrapBitfieldEx(CAS_Sharpness, "CASSharpness");
+	// Bitfield, not Entry: FSR_Sharpness is a u8, same as CAS_Sharpness above.
+	SettingsWrapBitfieldEx(FSR_Sharpness, "FSRSharpness");
 	SettingsWrapBitfieldEx(Dithering, "dithering_ps2");
 	SettingsWrapBitfieldEx(MaxAnisotropy, "MaxAnisotropy");
 	SettingsWrapBitfieldEx(SWExtraThreads, "extrathreads");
@@ -1187,6 +1203,14 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 
 	SettingsWrapEntryEx(ShaderChainEnabled, "ShaderChainEnabled");
 	SettingsWrapEntryEx(ShaderChainPreset, "ShaderChainPreset");
+
+	SettingsWrapEntryEx(LsfgEnabled, "LsfgEnabled");
+	// Bitfield, not Entry: LsfgMultiplier is a u8, and the plain entry wrapper has no
+	// overload for one — the same reason CAS_Sharpness above uses it.
+	SettingsWrapBitfieldEx(LsfgMultiplier, "LsfgMultiplier");
+	SettingsWrapEntryEx(LsfgDllPath, "LsfgDllPath");
+	SettingsWrapEntryEx(LsfgPerformance, "LsfgPerformance");
+	SettingsWrapBitfieldEx(LsfgFlowScale, "LsfgFlowScale");
 
 	SettingsWrapEntryEx(CaptureContainer, "CaptureContainer");
 	SettingsWrapEntryEx(VideoCaptureCodec, "VideoCaptureCodec");
