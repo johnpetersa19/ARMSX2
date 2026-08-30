@@ -732,10 +732,6 @@ void SetBranchImmCall(u32 imm, u32 return_pc);
 void iFlushCall(int flushtype);
 void recBranchCall(void (*func)());
 void recCall(void (*func)());
-// Emit the post-interpreter-call TLB-miss exception dispatch (defined in
-// iR5900-arm64.cpp). DispatcherReg/s_recTlbMissOccurred are file-local there,
-// so cross-TU interpreter-call sites (recVTLB-arm64.cpp) route through this.
-void recEmitInterpTlbMissCheck();
 u32 scaleblockcycles_clear();
 
 // COP2 / VU0 sync emit helper (defined in iCOP2-arm64.cpp).
@@ -1009,6 +1005,17 @@ namespace EERecFallback
 	inline constexpr int kCop2VuIdCount = 256;
 	extern u64 g_cop2VuMask[kCop2VuIdCount / 64];
 
+	// Per-COP1-op filter, the next bisect axis once `fpu` is implicated. Ids are
+	// the S-format funct, plus one each for what the other rs values select.
+	// All bits set (the default) means "every op".
+	inline constexpr int kFpuIdCount = 128;
+	extern u64 g_fpuMask[kFpuIdCount / 64];
+
+	// Flat id for a COP1/LWC1/SWC1 encoding, or -1.
+	int FpuOpId(u32 code);
+	// Mnemonic for an id, or nullptr.
+	const char* FpuOpName(int id);
+
 	// Canonical id for a VU macro op, or -1 if `code` is not one.
 	int Cop2VuOpId(u32 code);
 	// Mnemonic for an id ("vmulaw"), or nullptr for an unassigned slot.
@@ -1029,11 +1036,21 @@ namespace EERecFallback
 	// Returns false and leaves the outputs untouched on a parse error.
 	// `reg_masks` must point at kCop2MoveOpCount entries, `cop2vu_mask` at
 	// kCop2VuIdCount/64.
-	bool ParseGroups(const std::string_view& list, u32* out, u32* reg_masks,
+	bool ParseGroups(const std::string_view& list, u32* out, u32* reg_masks, u64* fpu_mask,
 		u64* cop2vu_mask, std::string* error);
 
 	// Human-readable rendering of a mask, for run banners.
 	std::string DescribeGroups(u32 groups);
+
+	// One-shot env-var entry point, for hunts under the full frontend rather
+	// than pcsx2-eerunner's --rec-fallback: ARMSX2_REC_FALLBACK takes the same
+	// group list, ARMSX2_REC_FALLBACK_CENSUS=1 dumps the COP2 macro-op census.
+	// Unset means untouched globals and no output.
+	void InitFromEnvOnce();
+	// Census line for the console, when the env var asked for it. `end_of_run`
+	// is the shutdown dump and prints whatever it has, including nothing at
+	// all; the per-reset calls stay quiet until the counts have moved.
+	void MaybeLogCop2VuCensus(bool end_of_run);
 } // namespace EERecFallback
 
 #endif // PCSX2_RECOMPILER_TESTS

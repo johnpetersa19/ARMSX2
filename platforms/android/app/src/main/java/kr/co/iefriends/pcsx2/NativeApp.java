@@ -174,7 +174,7 @@ public class NativeApp {
 	 * {@link #reloadPatches()} to apply. Writing the .pnach file alone is NOT
 	 * enough — a patch is inert unless its name is enabled here.
 	 */
-	public static native void setEnabledPatches(boolean cheats, String[] allNames, String[] enabledNames);
+	public static native void setEnabledPatches(boolean cheats, String[] allNames, String[] enabledNames, String serial);
 	/**
 	 * One-time repair: drop the GLOBAL [Patches]/[Cheats] "Enable" lists.
 	 * <p>
@@ -182,7 +182,6 @@ public class NativeApp {
 	 * patches are enabled by NAME those entries armed the same-named group in the bundled pnach
 	 * archive for every game. Per-game lists are left alone. Call once, gated on a pref.
 	 */
-	public static native void purgeGlobalPatchEnableLists();
 
 	// ---- USB lightgun (GunCon 2) ----------------------------------------------
 	/** GunCon2 binding ids, from pcsx2/USB/usb-lightgun/guncon2.cpp. */
@@ -228,6 +227,19 @@ public class NativeApp {
 	public static native float getFPS();
 	/** Current game's nominal emulated refresh (~59.94 NTSC / 50 PAL), or 0 without a VM. */
 	public static native float getNominalFrameRate();
+
+	/** The rest of the in-game OSD's figures, for the second-screen panel. All return 0 with
+	 *  no VM running rather than the last value, so an idle panel reads as idle. */
+	/** Push device temperatures to the performance overlay. ARMSX2_THERMAL_NONE means
+	 *  "no reading" — the overlay then omits that figure rather than drawing a zero. */
+	public static native void setThermals(float cpu, float gpu, float battery, boolean show);
+
+	public static native float getVPS();
+	public static native float getEmuSpeedPercent();
+	public static native float getCpuThreadUsage();
+	public static native float getGsThreadUsage();
+	public static native float getGpuUsage();
+	public static native float getAverageFrameTime();
 
 	/** Build version string from BuildVersion::GitRev — formatted as
 	 *  "GitTagHi.GitTagMid.GitTagLo.ARMSX2Build-SNAPSHOT". Used by the
@@ -736,6 +748,11 @@ public class NativeApp {
 	 *  Safe to call with no game running and on any build (the Play build always
 	 *  answers NOT_COMPILED_IN). */
 	public static native int lsfgAvailability(String dllPath);
+
+	/** Tell the native side the file behind the current path was replaced, so the next
+	 *  lsfgAvailability() re-reads it. The import always writes to the same path, so nothing
+	 *  else can notice. */
+	public static native void lsfgDllChanged();
 
 	public static native void flushShaderCache();
 

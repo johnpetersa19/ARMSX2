@@ -529,6 +529,10 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
 #endif
 
 	m_optional_extensions.vk_ext_fragment_shader_interlock = SupportsExtension(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, false);
+	// LSFG frame generation only. PCSX2 targets Vulkan 1.1, where neither is core — the memory
+	// model is 1.2 and nullDescriptor never became core at all — so both come in as extensions.
+	m_optional_extensions.vk_khr_vulkan_memory_model = SupportsExtension(VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME, false);
+	m_optional_extensions.vk_ext_robustness2_null_descriptor = SupportsExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, false);
 
 	return true;
 }
@@ -544,6 +548,10 @@ bool GSDeviceVK::SelectDeviceFeatures()
 	m_device_features.wideLines = available_features.wideLines;
 	m_device_features.fragmentStoresAndAtomics = available_features.fragmentStoresAndAtomics;
 	m_device_features.textureCompressionBC = available_features.textureCompressionBC;
+	// Enabled at logical-device creation, not merely queried: sampling an ASTC image
+	// without the feature bit enabled is a validation error and undefined behaviour on
+	// some drivers. SelectDeviceFeatures() runs before vkCreateDevice().
+	m_device_features.textureCompressionASTC_LDR = available_features.textureCompressionASTC_LDR;
 	m_device_features.geometryShader = available_features.geometryShader;
 	m_device_features.fragmentStoresAndAtomics = available_features.fragmentStoresAndAtomics;
 	m_device_features.pipelineStatisticsQuery = available_features.pipelineStatisticsQuery;
@@ -718,6 +726,10 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
 	VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT fragment_shader_interlock_ext_feature = {
 		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+	VkPhysicalDeviceVulkanMemoryModelFeatures vulkan_memory_model_feature = {
+		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES};
+	VkPhysicalDeviceRobustness2FeaturesEXT robustness2_feature = {
+		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
 
 	// An advertised EXTENSION does not guarantee its FEATURE bit, and asking for a feature the
 	// driver does not have fails vkCreateDevice outright with VK_ERROR_FEATURE_NOT_PRESENT —
@@ -743,6 +755,10 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
 		VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT probe_fsi = {
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+		VkPhysicalDeviceVulkanMemoryModelFeatures probe_vmm = {
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES};
+		VkPhysicalDeviceRobustness2FeaturesEXT probe_r2 = {
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
 
 		// Only chain what we would actually enable: querying a struct whose extension is absent is
 		// not something the spec promises anything about.
@@ -759,6 +775,10 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 			Vulkan::AddPointerToChain(&probe, &probe_sm1);
 		if (m_optional_extensions.vk_ext_fragment_shader_interlock)
 			Vulkan::AddPointerToChain(&probe, &probe_fsi);
+		if (m_optional_extensions.vk_khr_vulkan_memory_model)
+			Vulkan::AddPointerToChain(&probe, &probe_vmm);
+		if (m_optional_extensions.vk_ext_robustness2_null_descriptor)
+			Vulkan::AddPointerToChain(&probe, &probe_r2);
 		vkGetPhysicalDeviceFeatures2(m_physical_device, &probe);
 
 		// Returns the flag rather than taking it by reference: m_optional_extensions members are
@@ -792,6 +812,13 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 		m_optional_extensions.vk_ext_fragment_shader_interlock = keep("VK_EXT_fragment_shader_interlock",
 			m_optional_extensions.vk_ext_fragment_shader_interlock,
 			probe_fsi.fragmentShaderPixelInterlock == VK_TRUE);
+		m_optional_extensions.vk_khr_vulkan_memory_model = keep("VK_KHR_vulkan_memory_model",
+			m_optional_extensions.vk_khr_vulkan_memory_model, probe_vmm.vulkanMemoryModel == VK_TRUE);
+		// The FEATURE we want is nullDescriptor specifically. VK_EXT_robustness2 also carries
+		// robustBufferAccess2/robustImageAccess2, which cost performance and which nothing here
+		// needs — they are deliberately left VK_FALSE below.
+		m_optional_extensions.vk_ext_robustness2_null_descriptor = keep("VK_EXT_robustness2 (nullDescriptor)",
+			m_optional_extensions.vk_ext_robustness2_null_descriptor, probe_r2.nullDescriptor == VK_TRUE);
 
 		// Depth ROAA is an optional sub-feature: a driver can offer the extension and colour
 		// access yet not depth.
@@ -831,6 +858,17 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 	{
 		fragment_shader_interlock_ext_feature.fragmentShaderPixelInterlock = VK_TRUE;
 		Vulkan::AddPointerToChain(&device_info, &fragment_shader_interlock_ext_feature);
+	}
+	if (m_optional_extensions.vk_khr_vulkan_memory_model)
+	{
+		vulkan_memory_model_feature.vulkanMemoryModel = VK_TRUE;
+		Vulkan::AddPointerToChain(&device_info, &vulkan_memory_model_feature);
+	}
+	if (m_optional_extensions.vk_ext_robustness2_null_descriptor)
+	{
+		// nullDescriptor ONLY — see the note by the probe above.
+		robustness2_feature.nullDescriptor = VK_TRUE;
+		Vulkan::AddPointerToChain(&device_info, &robustness2_feature);
 	}
 
 	VkResult res = vkCreateDevice(m_physical_device, &device_info, nullptr, &m_device);
@@ -2636,6 +2674,12 @@ bool GSDeviceVK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	// Same non-fatal treatment as CAS above, and for the same reason: FSR1 is two more compute
 	// pipelines, so a driver that chokes on CAS's will likely choke on these too. Leaving
 	// Features().fsr1 false makes GSRenderer fall back to the plain bilinear present.
+	if (!CompileSGSRPipeline())
+	{
+		Console.Warning("VK: SGSR pipeline compilation failed - disabling SGSR upscaling.");
+		m_features.sgsr = false;
+	}
+
 	if (!CompileFSR1Pipelines())
 	{
 		Console.Warning("VK: FSR1 pipeline compilation failed - disabling FSR1 upscaling.");
@@ -3916,6 +3960,38 @@ bool GSDeviceVK::CheckFeatures()
 	m_features.dxt_textures = m_device_features.textureCompressionBC;
 	m_features.bptc_textures = m_device_features.textureCompressionBC;
 
+	// ASTC LDR: the device feature must be enabled (SelectDeviceFeatures) AND every
+	// footprint the loader accepts must be sampleable with optimal tiling. All-or-nothing,
+	// because the loader is format-agnostic once a pack is installed.
+	m_features.astc_textures = false;
+	if (m_device_features.textureCompressionASTC_LDR)
+	{
+		static constexpr std::array<VkFormat, 14> s_astc_formats = {{
+			VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_FORMAT_ASTC_5x4_UNORM_BLOCK, VK_FORMAT_ASTC_5x5_UNORM_BLOCK,
+			VK_FORMAT_ASTC_6x5_UNORM_BLOCK, VK_FORMAT_ASTC_6x6_UNORM_BLOCK, VK_FORMAT_ASTC_8x5_UNORM_BLOCK,
+			VK_FORMAT_ASTC_8x6_UNORM_BLOCK, VK_FORMAT_ASTC_8x8_UNORM_BLOCK, VK_FORMAT_ASTC_10x5_UNORM_BLOCK,
+			VK_FORMAT_ASTC_10x6_UNORM_BLOCK, VK_FORMAT_ASTC_10x8_UNORM_BLOCK, VK_FORMAT_ASTC_10x10_UNORM_BLOCK,
+			VK_FORMAT_ASTC_12x10_UNORM_BLOCK, VK_FORMAT_ASTC_12x12_UNORM_BLOCK,
+		}};
+
+		bool all_ok = true;
+		for (const VkFormat fmt : s_astc_formats)
+		{
+			VkFormatProperties props = {};
+			vkGetPhysicalDeviceFormatProperties(m_physical_device, fmt, &props);
+			if (!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) ||
+				!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_DST_BIT))
+			{
+				all_ok = false;
+				break;
+			}
+		}
+		m_features.astc_textures = all_ok;
+	}
+
+	DevCon.WriteLn("Vulkan: ASTC LDR texture replacements %s.",
+		m_features.astc_textures ? "active" : "not supported by this device/driver");
+
 	// The "no stencil buffer or texture barrier" warning is deliberately NOT shown on Android.
 	// UseRenderTargetCopyForFeedback turns texture barriers off by design on the mobile drivers
 	// this ships to (see the feedback notes above), so the condition is the NORMAL configuration
@@ -4027,6 +4103,20 @@ VkFormat GSDeviceVK::LookupNativeFormat(GSTexture::Format format) const
 		VK_FORMAT_BC2_UNORM_BLOCK, // BC2
 		VK_FORMAT_BC3_UNORM_BLOCK, // BC3
 		VK_FORMAT_BC7_UNORM_BLOCK, // BC7
+		VK_FORMAT_ASTC_4x4_UNORM_BLOCK, // ASTC4x4
+		VK_FORMAT_ASTC_5x4_UNORM_BLOCK, // ASTC5x4
+		VK_FORMAT_ASTC_5x5_UNORM_BLOCK, // ASTC5x5
+		VK_FORMAT_ASTC_6x5_UNORM_BLOCK, // ASTC6x5
+		VK_FORMAT_ASTC_6x6_UNORM_BLOCK, // ASTC6x6
+		VK_FORMAT_ASTC_8x5_UNORM_BLOCK, // ASTC8x5
+		VK_FORMAT_ASTC_8x6_UNORM_BLOCK, // ASTC8x6
+		VK_FORMAT_ASTC_8x8_UNORM_BLOCK, // ASTC8x8
+		VK_FORMAT_ASTC_10x5_UNORM_BLOCK, // ASTC10x5
+		VK_FORMAT_ASTC_10x6_UNORM_BLOCK, // ASTC10x6
+		VK_FORMAT_ASTC_10x8_UNORM_BLOCK, // ASTC10x8
+		VK_FORMAT_ASTC_10x10_UNORM_BLOCK, // ASTC10x10
+		VK_FORMAT_ASTC_12x10_UNORM_BLOCK, // ASTC12x10
+		VK_FORMAT_ASTC_12x12_UNORM_BLOCK, // ASTC12x12
 	}};
 
 	if (format == GSTexture::Format::ColorClip && m_colorclip_fallback_to_hdr)
@@ -6097,6 +6187,56 @@ bool GSDeviceVK::CompileFSR1Pipelines()
 	return true;
 }
 
+bool GSDeviceVK::CompileSGSRPipeline()
+{
+	VkDevice dev = m_device;
+	Vulkan::DescriptorSetLayoutBuilder dslb;
+	Vulkan::PipelineLayoutBuilder plb;
+
+	if (m_use_push_descriptors)
+		dslb.SetPushFlag();
+	// Combined image sampler for the same reason FSR1 needs one: SGSR reads through
+	// textureGather, which has to have a sampler bound to the image.
+	dslb.AddBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT);
+	dslb.AddBinding(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);
+	if ((m_sgsr_ds_layout = dslb.Create(dev)) == VK_NULL_HANDLE)
+		return false;
+	Vulkan::SetObjectName(dev, m_sgsr_ds_layout, "SGSR descriptor layout");
+
+	plb.AddPushConstants(VK_SHADER_STAGE_COMPUTE_BIT, 0, NUM_SGSR_CONSTANTS * sizeof(u32));
+	plb.AddDescriptorSet(m_sgsr_ds_layout);
+	if ((m_sgsr_pipeline_layout = plb.Create(dev)) == VK_NULL_HANDLE)
+		return false;
+	Vulkan::SetObjectName(dev, m_sgsr_pipeline_layout, "SGSR pipeline layout");
+
+	// Two modules from two differently-#define'd copies of one file, the same shape FSR1 uses:
+	// the variant decides which filter body the preprocessor emits at all, so it cannot be a
+	// specialization constant.
+	for (u8 edge = 0; edge < NUM_SGSR_PIPELINES; edge++)
+	{
+		std::optional<std::string> sgsr_source = ReadShaderSource("shaders/vulkan/sgsr.glsl");
+		if (!sgsr_source.has_value())
+			return false;
+		sgsr_source->insert(0, edge ? "#version 460 core\n#define SGSR_EDGE_DIRECTION 1\n"
+									: "#version 460 core\n#define SGSR_EDGE_DIRECTION 0\n");
+
+		VkShaderModule mod = g_vulkan_shader_cache->GetComputeShader(sgsr_source->c_str());
+		if (mod == VK_NULL_HANDLE)
+			return false;
+		ScopedGuard mod_guard = [this, &mod]() { vkDestroyShaderModule(m_device, mod, nullptr); };
+
+		Vulkan::ComputePipelineBuilder cpb;
+		cpb.SetPipelineLayout(m_sgsr_pipeline_layout);
+		cpb.SetShader(mod, "main");
+		m_sgsr_pipelines[edge] = cpb.Create(dev, g_vulkan_shader_cache->GetPipelineCache(true), false);
+		if (!m_sgsr_pipelines[edge])
+			return false;
+	}
+
+	m_features.sgsr = true;
+	return true;
+}
+
 bool GSDeviceVK::CompileImGuiPipeline()
 {
 	const std::optional<std::string> glsl = ReadShaderSource("shaders/vulkan/imgui.glsl");
@@ -6471,6 +6611,76 @@ bool GSDeviceVK::DoFSR1Pass(
 	return true;
 }
 
+bool GSDeviceVK::DoSGSR(GSTexture* sTex, GSTexture* dTex, const std::array<u32, NUM_SGSR_CONSTANTS>& constants,
+	bool edge_direction)
+{
+	g_perfmon.Put(GSPerfMon::TextureCopies, 1);
+
+	EndRenderPass();
+
+	GSTextureVK* const sTexVK = static_cast<GSTextureVK*>(sTex);
+	GSTextureVK* const dTexVK = static_cast<GSTextureVK*>(dTex);
+	VkCommandBuffer cmdbuf = GetCurrentCommandBuffer();
+
+	// Input arrives from a colour-attachment write, exactly as FSR1's EASU input does. There is
+	// no compute->compute case here because SGSR has no intermediate.
+	sTexVK->TransitionToLayout(cmdbuf, GSTextureVK::Layout::ShaderReadOnly);
+
+	if (dTexVK->GetLayout() == GSTextureVK::Layout::ComputeReadWriteImage)
+	{
+		// Every frame after the first: order this dispatch's writes against the previous frame's
+		// reads of the same texture by the present pass. TransitionToLayout early-outs when the
+		// layout already matches, so a same-layout dependency has to be stated by hand.
+		const VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+			VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+			VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+			dTexVK->GetImage(), {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u}};
+		vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			0, 0, nullptr, 0, nullptr, 1, &barrier);
+	}
+	else
+	{
+		dTexVK->TransitionToLayout(cmdbuf, GSTextureVK::Layout::ComputeReadWriteImage);
+	}
+
+	// Normalised coordinates and gathers, so linear/clamp-to-edge, like EASU.
+	const VkSampler sampler = m_linear_sampler;
+
+	Vulkan::DescriptorSetUpdateBuilder dsub;
+	if (m_use_push_descriptors)
+	{
+		dsub.AddCombinedImageSamplerDescriptorWrite(VK_NULL_HANDLE, 0, sTexVK->GetView(), sampler, sTexVK->GetVkLayout());
+		dsub.AddStorageImageDescriptorWrite(VK_NULL_HANDLE, 1, dTexVK->GetView(), dTexVK->GetVkLayout());
+		dsub.PushUpdate(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_sgsr_pipeline_layout, 0, false);
+	}
+	else
+	{
+		VkDescriptorSet ds = AllocateDescriptorSetFromFramePool(m_sgsr_ds_layout);
+		if (ds == VK_NULL_HANDLE) [[unlikely]]
+			return false;
+		dsub.AddCombinedImageSamplerDescriptorWrite(ds, 0, sTexVK->GetView(), sampler, sTexVK->GetVkLayout());
+		dsub.AddStorageImageDescriptorWrite(ds, 1, dTexVK->GetView(), dTexVK->GetVkLayout());
+		dsub.Update(m_device);
+		vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_sgsr_pipeline_layout, 0, 1, &ds, 0, nullptr);
+	}
+
+	// 8x8 local size, one pixel per invocation — not FSR1's 16, which comes from its 64 threads
+	// each writing four pixels.
+	static const int threadGroupWorkRegionDim = 8;
+	const int dispatchX = (dTex->GetWidth() + (threadGroupWorkRegionDim - 1)) / threadGroupWorkRegionDim;
+	const int dispatchY = (dTex->GetHeight() + (threadGroupWorkRegionDim - 1)) / threadGroupWorkRegionDim;
+
+	vkCmdPushConstants(cmdbuf, m_sgsr_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+		NUM_SGSR_CONSTANTS * sizeof(u32), constants.data());
+	vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_sgsr_pipelines[edge_direction ? 1 : 0]);
+	vkCmdDispatch(cmdbuf, dispatchX, dispatchY, 1);
+
+	// Handed straight to the present pass, which samples it from the fragment stage.
+	dTexVK->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
+
+	return true;
+}
+
 void GSDeviceVK::DestroyResources()
 {
 	if (m_tfx_ubo_descriptor_set != VK_NULL_HANDLE)
@@ -6544,6 +6754,16 @@ void GSDeviceVK::DestroyResources()
 		vkDestroyPipelineLayout(m_device, m_fsr1_pipeline_layout, nullptr);
 	if (m_fsr1_ds_layout != VK_NULL_HANDLE)
 		vkDestroyDescriptorSetLayout(m_device, m_fsr1_ds_layout, nullptr);
+
+	for (VkPipeline it : m_sgsr_pipelines)
+	{
+		if (it != VK_NULL_HANDLE)
+			vkDestroyPipeline(m_device, it, nullptr);
+	}
+	if (m_sgsr_pipeline_layout != VK_NULL_HANDLE)
+		vkDestroyPipelineLayout(m_device, m_sgsr_pipeline_layout, nullptr);
+	if (m_sgsr_ds_layout != VK_NULL_HANDLE)
+		vkDestroyDescriptorSetLayout(m_device, m_sgsr_ds_layout, nullptr);
 
 	if (m_imgui_pipeline != VK_NULL_HANDLE)
 		vkDestroyPipeline(m_device, m_imgui_pipeline, nullptr);

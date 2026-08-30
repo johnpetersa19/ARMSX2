@@ -53,7 +53,9 @@ import com.armsx2.BuildConfig
 import com.armsx2.EmuState
 import com.armsx2.FilenameParser
 import com.armsx2.GameInfo
+import com.armsx2.MemoryCardBackup
 import com.armsx2.PlayTime
+import com.armsx2.i18n.str
 import com.armsx2.input.ControllerMappings
 import com.armsx2.input.SoftKeyboard
 import com.armsx2.runtime.MainActivityRuntime.Companion.internalBiosDir
@@ -135,6 +137,40 @@ open class MainActivityRuntime : ComponentActivity() {
     companion object {
         var instance: MainActivityRuntime? = null
         lateinit var prefs: SharedPreferences
+
+        // Tap-to-hold state (#612). In the companion rather than beside handleTurbo because the
+        // boot path that has to clear it -- a latch must not outlive the game it was set in --
+        // runs here, while the dispatch that sets it is an instance method. Instance methods see
+        // companion members, so both reach it.
+        private val latchDown = HashSet<Long>()  // physical buttons currently held, port|physical
+        private val latchHeld = HashSet<Long>()  // PS2 targets currently latched ON, port|target
+
+        /** A latch must not outlive the game it was set in. Called on each fresh start. */
+        fun clearLatches() {
+            latchDown.clear()
+            latchHeld.clear()
+        }
+
+        /**
+         * Release whatever is latched right now, through the normal dispatch so the analog and
+         * pressure bookkeeping unwinds with it.
+         *
+         * Turning tap-to-hold off for a button that is currently HELD would otherwise strand it
+         * pressed: the second tap that would have released it no longer toggles anything, so the
+         * game sees the button down forever. Called whenever the setting changes.
+         */
+        fun releaseLatches() {
+            val held = latchHeld.toList()
+            clearLatches()
+            val act = instance ?: return
+            held.forEach { key ->
+                act.sendKeyAction(
+                    KeyEventType.KeyUp,
+                    (key and 0xffffffffL).toInt(),   // target, as packed by turboMapKey
+                    (key ushr 32).toInt(),           // port
+                )
+            }
+        }
         val setupComplete = mutableStateOf(false)
         // Set at launch when a restored-but-unusable setup is detected (Auto Backup
         // brought back prefs incl. setupComplete, but the ROMs folder permission
@@ -448,6 +484,20 @@ open class MainActivityRuntime : ComponentActivity() {
         // pushed GS settings before the base settings layer existed → native SIGSEGV.
         private val pendingLaunch = mutableStateOf<Pair<String, GameInfo?>?>(null)
 
+        /** Names of the memory cards a pending launch found unreadable, when a verified backup
+         *  exists to put back. Non-empty holds the boot and shows the recovery prompt; the prompt
+         *  either restores and retries, or sets [memoryCardRecoveryBypass] and retries. */
+        val memoryCardRecovery = mutableStateOf<List<String>>(emptyList())
+
+        /** Set by "Start anyway" so the next [start] does not re-ask about the same card. Cleared
+         *  once that launch has gone through, so a later session asks again. */
+        private var memoryCardRecoveryBypass = false
+
+        fun dismissMemoryCardRecovery(startAnyway: Boolean) {
+            memoryCardRecovery.value = emptyList()
+            if (startAnyway) memoryCardRecoveryBypass = true
+        }
+
         fun invoke(task: suspend () -> Unit) {
             eScope.launch {
                 task()
@@ -635,6 +685,22 @@ open class MainActivityRuntime : ComponentActivity() {
         }
 
         fun start() {
+            // Pre-boot memory card pass. Here rather than after the VM is up because the card file
+            // is not open yet, so an unreadable card can still be put back before the game ever
+            // mounts it — and once the console has mounted a card it caches its own picture of the
+            // directory, which a restore underneath would not update.
+            if (!memoryCardRecoveryBypass && MemoryCardBackup.isEnabled()) {
+                val broken = instance?.applicationContext?.let { ctx ->
+                    runCatching {
+                        MemoryCardBackup.unreadableActiveCards(ctx, currentGame.value?.settingsKey)
+                    }.getOrDefault(emptyList())
+                }.orEmpty()
+                if (broken.isNotEmpty()) {
+                    // Held, not cancelled: the prompt calls start() again either way.
+                    memoryCardRecovery.value = broken
+                    return
+                }
+            }
             synchronized(vmLifecycleLock) {
                 if (vmStopInProgress || vmRunLoopActive || eState.value != EmuState.STOPPED) {
                     vmRestartAfterStop = true
@@ -642,10 +708,15 @@ open class MainActivityRuntime : ComponentActivity() {
                 }
                 vmRunLoopActive = true
             }
+            // Only now that this launch has actually committed. Clearing it above the early return
+            // would drop the user's "start anyway" on a deferred launch, and ask them again when
+            // the restart came round.
+            memoryCardRecoveryBypass = false
 
             invoke {
                 try {
                     eState.value = EmuState.RUNNING
+                    clearLatches()
                     println("@@ANDROID_START_VM@@ kind=game path=${m_szGamefile.take(240)}")
                     // Local co-op: re-pair controllers each session (first pad = P1,
                     // next = P2) so player slots are deterministic per boot.
@@ -668,6 +739,19 @@ open class MainActivityRuntime : ComponentActivity() {
                     // The hold itself waits for the VM to come up. BIOS boots skip it.
                     if (bootCfg.autoProgressiveScan)
                         startAutoProgressiveScanHold()
+                    // Bank a copy of the cards this boot will mount, while they are still closed.
+                    // Cheap and silent: it only writes when the card verifies AND its contents
+                    // differ from the newest copy, so relaunching without saving costs nothing.
+                    runCatching {
+                        instance?.applicationContext?.let { ctx ->
+                            println("@@ANDROID_MCDBAK@@ " + MemoryCardBackup.snapshotActiveCards(
+                                ctx,
+                                currentGame.value?.settingsKey,
+                                MemoryCardBackup.Reason.SESSION,
+                                currentGame.value?.title,
+                            ))
+                        }
+                    }
                     NativeApp.runVMThread(m_szGamefile)
                 } finally {
                     // runVMThread blocks until the VM exits (Stopping/Shutdown
@@ -1012,12 +1096,22 @@ open class MainActivityRuntime : ComponentActivity() {
             invoke {
                 try {
                     eState.value = EmuState.RUNNING
+                    clearLatches()
                     println("@@ANDROID_START_VM@@ kind=bios path=<empty>")
                     com.armsx2.input.PadRouter.reset()
                     // The BIOS is emulation too: claim the renderer rotation tier so it honours the
                     // Renderer page (global, since there is no game) instead of the launcher's.
                     emulationOwnsOrientation = true
                     applyRendererPrefs()
+                    // The BIOS mounts the cards too, and its memory card manager can format one or
+                    // delete saves off it — so this boot is worth a copy for the same reason a game
+                    // boot is. No serial here, so the global card choice is the right one.
+                    runCatching {
+                        instance?.applicationContext?.let { ctx ->
+                            println("@@ANDROID_MCDBAK@@ bios " + MemoryCardBackup.snapshotActiveCards(
+                                ctx, null, MemoryCardBackup.Reason.SESSION, null))
+                        }
+                    }
                     NativeApp.runVMThread(m_szGamefile)
                 } finally {
                     eState.value = EmuState.STOPPED
@@ -1093,7 +1187,24 @@ open class MainActivityRuntime : ComponentActivity() {
             NativeApp.pause()
         }
 
+        /**
+         * A pause the USER asked for and expects to stay.
+         *
+         * The stuck-paused backstop below resumes a VM that is paused with nothing covering the
+         * screen, on the reasoning that such a state can only be a lost resume. That was true
+         * while every pause came with a frontend over it -- pauseForOverlay() is what the quick
+         * menu, the library and backgrounding all use. The second screen broke the assumption:
+         * its Pause tile is the one caller of plain pause(), and it deliberately leaves the game
+         * on screen. The backstop then undid it 700ms later, which is what "pause immediately
+         * unpauses itself" was.
+         *
+         * Compose state rather than a plain flag because the backstop keys a LaunchedEffect on it.
+         */
+        val userHeldPause = mutableStateOf(false)
+
         fun resume() {
+            // Whatever the user was holding, they are done holding it.
+            userHeldPause.value = false
             if (vmStopInProgress)
                 return
             vmControl.execute {
@@ -1274,8 +1385,20 @@ open class MainActivityRuntime : ComponentActivity() {
         // library. GitHub #374 — "exit, press Load → nothing boots" because currentGame was null.
         val contextGame = mutableStateOf<GameInfo?>(null)
 
-        fun launchCurrentGameFromSaveSlot(slot: Int): Boolean {
+        fun launchCurrentGameFromSaveSlot(slot: Int): Boolean
+        {
             val game = currentGame.value ?: contextGame.value ?: return false
+            return launchGameFromSaveSlot(game, slot)
+        }
+
+        /**
+         * Boot [game] and load save slot [slot] once it is running.
+         *
+         * Split out of launchCurrentGameFromSaveSlot so the library's long-press menu can name the
+         * game explicitly: from the library nothing is booted, so currentGame and contextGame are
+         * both null and the original could never fire there.
+         */
+        fun launchGameFromSaveSlot(game: GameInfo, slot: Int): Boolean {
             val launchPath = if (game.uri.scheme == "file") {
                 game.uri.path ?: game.uri.toString()
             } else {
@@ -1467,8 +1590,11 @@ open class MainActivityRuntime : ComponentActivity() {
          */
         fun resetAppToDefaults(context: Context) {
             // Files first — clearing prefs drops the data-root pref that locates them.
-            runCatching { com.armsx2.config.ConfigStore.purgeAllSettingsFiles() }
-            runCatching { prefs.edit { clear() } }
+            runCatching { com.armsx2.config.ConfigStore.purgeAllSettingsFiles(context) }
+            // ★ commit, not apply. restartApp calls Runtime.exit(0) immediately below, and
+            // apply() only guarantees the in-memory update — its disk write is asynchronous and
+            // an abrupt exit can beat it. A reset that survives the restart is the entire point.
+            runCatching { prefs.edit().clear().commit() }
             restartApp(context)
         }
 
@@ -1795,27 +1921,12 @@ open class MainActivityRuntime : ComponentActivity() {
             NativeApp.initializeOnce(applicationContext)
             nativeReady.value = true
 
-            // One-time repair of globally-armed patches. Older builds filled the global
-            // [Patches]/[Cheats] Enable lists just by opening the Patch Manager, and since
-            // patches are matched BY NAME those entries armed the same-named group in the
-            // bundled archive for every game — the "60fps/16:9 with every patch setting off,
-            // and it won't turn off" reports. The auto-sync is gone, but existing installs
-            // still carry the poisoned lists, so clear them once. Must run after
-            // initializeOnce (the base settings layer has to exist).
-            // Key is versioned: v1 cleared only the base layer, which a stale PER-GAME list then
-            // shadowed (GOW2 still reported "1 game patch active" with everything off). Bumping it
-            // re-runs the now-complete purge for anyone who already took v1.
             // Lightgun: read the pref and re-assert the USB device type. The ini is
             // authoritative, but this covers a first run that has no USB section yet.
             runCatching {
                 com.armsx2.input.UsbDevices.load()
                 com.armsx2.input.Lightgun.load()
                 com.armsx2.input.UsbDevices.applyAtBoot()
-            }
-
-            if (!prefs.getBoolean("patchEnableListsPurged.v2", false)) {
-                runCatching { NativeApp.purgeGlobalPatchEnableLists() }
-                    .onSuccess { prefs.edit { putBoolean("patchEnableListsPurged.v2", true) } }
             }
 
             // Pin Filenames/BIOS to the file the setup wizard copied —
@@ -1892,6 +2003,36 @@ open class MainActivityRuntime : ComponentActivity() {
     private val turboPressed = HashMap<Long, Boolean>()
     private fun turboMapKey(physicalCode: Int, port: Int) =
         (port.toLong() shl 32) or (physicalCode.toLong() and 0xffffffffL)
+
+    // ---- Tap to hold (latch) -----------------------------------------------
+    // #612, requested by bobo123g: the on-screen buttons have had "tap to hold" since they
+    // existed, but physical buttons always followed the button exactly. A game that wants one
+    // held while you work another control -- MGS2 holding R1 to aim -- is then unplayable for
+    // anyone who cannot hold two controls at once.
+    //
+    // Modelled as a TRANSFORM on the event stream rather than a branch beside turbo: a tap
+    // becomes a synthetic KeyDown, the next tap a synthetic KeyUp, and everything in between is
+    // swallowed. Turbo then composes with it for free -- flag a button both and a tap toggles
+    // autofire on and off, which is what a shmup wants.
+    /**
+     * The event to act on for a latch-flagged button, or null when there is nothing to do.
+     *
+     * Keyed on the PHYSICAL code for "is this a fresh press" (ACTION_DOWN auto-repeats while a
+     * key is held, and each repeat would otherwise toggle) and on the TARGET for "is it latched",
+     * so two physical buttons bound to the same PS2 button cannot desync.
+     */
+    private fun latchEdge(physicalCode: Int, type: KeyEventType, target: Int, port: Int): KeyEventType? {
+        val physKey = turboMapKey(physicalCode, port)
+        if (type != KeyEventType.KeyDown) {
+            // Releasing the physical button is exactly what a latch ignores.
+            latchDown.remove(physKey)
+            return null
+        }
+        if (!latchDown.add(physKey)) return null // auto-repeat, not a new press
+        val tgtKey = turboMapKey(target, port)
+        return if (latchHeld.remove(tgtKey)) KeyEventType.KeyUp
+        else { latchHeld.add(tgtKey); KeyEventType.KeyDown }
+    }
 
     private fun handleTurbo(physicalCode: Int, type: KeyEventType, target: Int, port: Int) {
         val key = turboMapKey(physicalCode, port)
@@ -2076,6 +2217,7 @@ open class MainActivityRuntime : ComponentActivity() {
         com.armsx2.ui.theme.ThemePreferences.load()
         com.armsx2.ui.theme.BootLogoPreferences.load()
         com.armsx2.ui.ScreenPinning.load()
+        com.armsx2.ui.QuickMenuSide.load()
         com.armsx2.ui.theme.ToolbarPositionPreferences.load()
         com.armsx2.ui.theme.LibraryChromePreferences.load()
         com.armsx2.ui.theme.LauncherOrientationPreferences.load()
@@ -2089,10 +2231,12 @@ open class MainActivityRuntime : ComponentActivity() {
         com.armsx2.OverlayRepo.load()
         com.armsx2.CoverRegionIndex.load()
         // Only parses the 2.6MB GameDB when a non-default cover region is actually in use.
-        if (com.armsx2.CoverRegionIndex.region.intValue != 0)
+        if (com.armsx2.CoverRegionIndex.needsIndex())
             com.armsx2.CoverRegionIndex.ensureBuilt(applicationContext)
         // Second-display utility panel (Ayn Thor / Retroid dual screen). No-op with one display.
         com.armsx2.SecondScreen.load()
+        runCatching { com.armsx2.Thermals.loadOsdEnabled(applicationContext) }
+        com.armsx2.SecondScreenLayout.load()
         com.armsx2.SecondScreen.attach(applicationContext)
         com.armsx2.BatteryWatcher.load()
         com.armsx2.BatteryWatcher.start(applicationContext)
@@ -2296,6 +2440,40 @@ open class MainActivityRuntime : ComponentActivity() {
             if (!setupComplete.value || setupEditorVisible.value) {
                 com.armsx2.ui.onboarding.OnboardingScreen()
             } else if (setupComplete.value) {
+                // A launch found an active memory card it could not read, and has a verified
+                // backup to put back. The boot is held until this is answered — restoring after
+                // the console has mounted the card would be overwritten by its cached directory.
+                memoryCardRecovery.value.takeIf { it.isNotEmpty() }?.let { broken ->
+                    val ctx = androidx.compose.ui.platform.LocalContext.current
+                    val cardName = broken.first()
+                    val newest = androidx.compose.runtime.remember(cardName) {
+                        com.armsx2.MemoryCardBackup.list(ctx, cardName).firstOrNull { it.healthy }
+                    }
+                    com.armsx2.ui.common.ConfirmOverlay(
+                        title = str("memcard.recovery.title"),
+                        message = str("memcard.recovery.body")
+                            .format(cardName, newest?.takenAtText.orEmpty()),
+                        confirmLabel = str("memcard.recovery.restore"),
+                        dismissLabel = str("memcard.recovery.ignore"),
+                        idPrefix = "memcard-recovery",
+                        onConfirm = {
+                            val snap = newest
+                            dismissMemoryCardRecovery(startAnyway = true)
+                            invoke {
+                                if (snap != null) {
+                                    withContext(Dispatchers.IO) {
+                                        com.armsx2.MemoryCardBackup.restore(ctx, snap)
+                                    }
+                                }
+                                start()
+                            }
+                        },
+                        onDismiss = {
+                            dismissMemoryCardRecovery(startAnyway = true)
+                            start()
+                        },
+                    )
+                }
                 // Per-game play-time tracking: count while RUNNING, accumulate on
                 // pause / stop / background. Keyed on the serial too so the session
                 // re-arms once currentGame resolves shortly after launch.
@@ -2504,7 +2682,10 @@ open class MainActivityRuntime : ComponentActivity() {
                         val stuckPaused = !WindowImpl.frontendCovers &&
                             eState.value == EmuState.PAUSED &&
                             !WindowImpl.showLibrary.value &&
-                            !com.armsx2.ui.touch.TouchControls.editMode.value
+                            !com.armsx2.ui.touch.TouchControls.editMode.value &&
+                            // A pause with nothing over it is not always a lost resume -- the
+                            // second screen pauses on purpose and leaves the game visible.
+                            !userHeldPause.value
                         androidx.compose.runtime.LaunchedEffect(stuckPaused) {
                             if (!stuckPaused) return@LaunchedEffect
                             // The normal close path posts its resume after a 220 ms dismiss
@@ -2513,7 +2694,8 @@ open class MainActivityRuntime : ComponentActivity() {
                                 kotlinx.coroutines.delay(700)
                                 if (eState.value != EmuState.PAUSED || WindowImpl.frontendCovers ||
                                     WindowImpl.showLibrary.value ||
-                                    com.armsx2.ui.touch.TouchControls.editMode.value
+                                    com.armsx2.ui.touch.TouchControls.editMode.value ||
+                                    userHeldPause.value
                                 ) return@LaunchedEffect
                                 println("@@ANDROID_RESUME_RETRY@@ attempt=$it eState=${eState.value}")
                                 resume()
@@ -3121,6 +3303,14 @@ open class MainActivityRuntime : ComponentActivity() {
             // re-add it for the match (FAST_FORWARD needs to recognise its own
             // release). heldKeys still carries the modifier either way.
             val matchKeys = if (down) heldKeys else heldKeys + kc
+            // A trigger the axis path already acted on this press. Only L2/R2 can be claimed,
+            // and only by sendTrigger — see triggerHotkeyClaimed.
+            if ((kc == KeyEvent.KEYCODE_BUTTON_L2 || kc == KeyEvent.KEYCODE_BUTTON_R2) &&
+                triggerHotkeyClaimed.contains(kc))
+            {
+                if (!down) triggerHotkeyClaimed.remove(kc)
+                return true
+            }
             when (ControllerMappings.matchHotkey(kc, matchKeys)) {
                 // Pressure modifier is a hold, handled (and consumed) earlier in
                 // dispatchKeyEvent; it never reaches this one-shot action switch.
@@ -3176,6 +3366,10 @@ open class MainActivityRuntime : ComponentActivity() {
                 }
                 ControllerMappings.SysHotkey.TOGGLE_KEYBOARD -> {
                     if (down && event.repeatCount == 0) toggleSoftKeyboard()
+                    return true
+                }
+                ControllerMappings.SysHotkey.DISPLAY_REFRESH -> {
+                    if (down && event.repeatCount == 0) cycleDisplayRefresh()
                     return true
                 }
                 ControllerMappings.SysHotkey.GYRO_HOLD -> {
@@ -3282,10 +3476,15 @@ open class MainActivityRuntime : ComponentActivity() {
         }
 
         val target = ControllerMappings.targetForPhysical(physicalCode, port) ?: return false
+        // Tap to hold rewrites the edges before anything else sees them (#612); a swallowed event
+        // is still consumed, or the key would fall through to the frontend.
+        val edge = if (ControllerMappings.isLatchTarget(target, port))
+            latchEdge(physicalCode, type, target, port) ?: return true
+        else type
         if (ControllerMappings.isTurboTarget(target, port)) {
-            handleTurbo(physicalCode, type, target, port)
+            handleTurbo(physicalCode, edge, target, port)
         } else {
-            sendKeyAction(type, target, port)
+            sendKeyAction(edge, target, port)
         }
         return true
     }
@@ -3459,6 +3658,49 @@ open class MainActivityRuntime : ComponentActivity() {
             )
         }
         android.widget.Toast.makeText(this, "Resolution ${next}x", android.widget.Toast.LENGTH_SHORT).show()
+    }
+
+    /** Cycle the panel through the refresh rates it supports AT THE CURRENT RESOLUTION, so the
+     *  request never doubles as a resolution change (the same filter EmulationSurface applies to
+     *  its frame-rate vote). Highest first, wrapping — one press on a 120Hz phone gives 120 → 90
+     *  → 60 → 120.
+     *
+     *  preferredDisplayModeId rather than Surface.setFrameRate: the surface call is a pacing HINT
+     *  the compositor is free to ignore, which is right for latency but useless as a user-facing
+     *  toggle. This is a window-level mode request, and it survives EmulationSurface's periodic
+     *  re-vote because the two feed different parts of mode selection.
+     *
+     *  Session-only, deliberately: it is a "right now, on this panel" control, and a persisted
+     *  refresh override would follow the user onto a device whose modes don't match. */
+    private var refreshModeIndex = -1
+    private fun cycleDisplayRefresh() {
+        @Suppress("DEPRECATION")
+        val disp = runCatching {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R)
+                display else windowManager.defaultDisplay
+        }.getOrNull() ?: return
+        val modes = disp.supportedModes
+            .filter {
+                it.physicalWidth == disp.mode.physicalWidth &&
+                    it.physicalHeight == disp.mode.physicalHeight && it.refreshRate > 0f
+            }
+            // One entry per distinct rate — panels list several mode ids at the same Hz.
+            .distinctBy { Math.round(it.refreshRate) }
+            .sortedByDescending { it.refreshRate }
+        if (modes.size < 2) {
+            hotkeyToast("Only ${Math.round(disp.mode.refreshRate)} Hz available")
+            return
+        }
+        // Start from whatever the panel is on now, not from index 0, so the first press
+        // steps DOWN from the current rate instead of jumping to the top of the list.
+        if (refreshModeIndex < 0)
+            refreshModeIndex = modes.indexOfFirst { it.modeId == disp.mode.modeId }.coerceAtLeast(0)
+        refreshModeIndex = (refreshModeIndex + 1) % modes.size
+        val next = modes[refreshModeIndex]
+        runCatching {
+            window.attributes = window.attributes.apply { preferredDisplayModeId = next.modeId }
+        }
+        hotkeyToast("Display ${Math.round(next.refreshRate)} Hz")
     }
 
     // Corrects the Samsung QHD on-screen-touch offset before the event is dispatched (a strict no-op
@@ -4553,6 +4795,7 @@ open class MainActivityRuntime : ComponentActivity() {
             ControllerMappings.SysHotkey.SLOW_DOWN -> toggleSlowDown()
             ControllerMappings.SysHotkey.TOGGLE_OSD -> hotkeyToast(InGameOverlay.cycleOsd())
             ControllerMappings.SysHotkey.TOGGLE_KEYBOARD -> toggleSoftKeyboard()
+            ControllerMappings.SysHotkey.DISPLAY_REFRESH -> cycleDisplayRefresh()
             // Hold-type hotkeys have no one-shot stick-edge meaning.
             ControllerMappings.SysHotkey.FAST_FORWARD,
             ControllerMappings.SysHotkey.PRESSURE_MOD -> {}
@@ -4719,6 +4962,22 @@ open class MainActivityRuntime : ComponentActivity() {
     // trigger-bound hotkeys, so each press fires once and re-arms on release.
     private val triggerHotkeyHeld = Array(8) { HashSet<Int>() }
 
+    /**
+     * Trigger keycodes whose hotkey edge the AXIS path has already fired for the current press.
+     *
+     * ★ Some pads report a trigger BOTH ways — as an axis and as a key event — so a single pull
+     * reaches the hotkey dispatcher twice, once from sendTrigger and once from the key path. For
+     * a hold that is harmless (both compute the same state). For a TOGGLE it is fatal: the first
+     * flips it on and the second immediately flips it back, which is why Fast Forward (Toggle)
+     * bound to L2/R2 came on for a frame and then reported OFF, worked when bound to a
+     * non-trigger button, and worked once the pad was switched to digital triggers — reported by
+     * SKrazy on an AYN pad and Shmoda12 on a Thor.
+     *
+     * The axis path claims the press; the key path sees the claim and skips its own edge. Scoped
+     * to L2/R2 alone so nothing else changes, and cleared on release so the next pull re-arms.
+     */
+    private val triggerHotkeyClaimed = HashSet<Int>()
+
     private fun sendTrigger(event: MotionEvent, left: Boolean, port: Int) {
         // -1 = no trigger axis on this side; its L2/R2 is a key event, key path owns it.
         val raw = triggerTravel(event, left)
@@ -4734,6 +4993,9 @@ open class MainActivityRuntime : ComponentActivity() {
         if (pressed) heldKeys.add(code)
         if (pressed != held.contains(code)) {
             if (pressed) held.add(code) else { held.remove(code); heldKeys.remove(code) }
+            // Claim this press so the key path does not fire the same hotkey again on a pad
+            // that reports the trigger both ways. See triggerHotkeyClaimed.
+            if (pressed) triggerHotkeyClaimed.add(code) else triggerHotkeyClaimed.remove(code)
             // Triggers now reach the Hotkeys tab's capture like any other button, so they have
             // to be able to fire one here. Hold-type hotkeys act on both edges (a trigger has a
             // real release, unlike a stick edge); the rest fire on the press. Matching on
